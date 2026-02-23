@@ -1,15 +1,24 @@
 import streamlit as st
-import google.generativeai as genai
 import pandas as pd
 from PIL import Image
 import json
 import time
 import io
+import base64
+from openai import OpenAI # Use pip install openai
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="AI Exam Dashboard", layout="wide")
 
 MASTER_PASSWORD = "your_password" 
+
+# --- GITHUB MODELS SETUP ---
+# This connects to GitHub's free "GPT-4o-mini"
+token = st.secrets.get("GITHUB_TOKEN", "")
+client = OpenAI(
+    base_url="https://models.inference.ai.azure.com",
+    api_key=token,
+)
 
 def check_password():
     if "authenticated" not in st.session_state:
@@ -22,64 +31,54 @@ def check_password():
         return False
     return True
 
+def encode_image(image_file):
+    return base64.b64encode(image_file.read()).decode("utf-8")
+
 if check_password():
     st.sidebar.title("⚙️ Settings")
-    api_key = st.sidebar.text_input("Gemini API Key", type="password", value=st.secrets.get("GEMINI_API_KEY", ""))
     divisor = st.sidebar.number_input("Divide marks by:", value=10.0)
 
-    st.title("📝 AI Exam Grader (Stable Version)")
+    st.title("📝 AI Exam Grader (GitHub Models Edition)")
     uploaded_files = st.file_uploader("Upload Exam Photos", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'])
 
-    if uploaded_files and api_key:
-        genai.configure(api_key=api_key)
-        # Switching to the 1.5 Stable model for better Free Tier reliability
-        model = genai.GenerativeModel('gemini-1.5-flash')
-
+    if uploaded_files and token:
         if st.button(f"🚀 Start Grading {len(uploaded_files)} Papers"):
             results = []
             progress_bar = st.progress(0)
-            status_text = st.empty()
-
+            
             for i, file in enumerate(uploaded_files):
-                status_text.text(f"Processing {file.name} ({i+1}/{len(uploaded_files)})...")
-                img = Image.open(file)
+                st.write(f"Reading {file.name}...")
                 
-                prompt = f"""
-                Return ONLY a JSON:
-                1. Identify Name and Index.
-                2. Sum all RED ink marks.
-                3. Double-check the addition.
-                {{ "name": "str", "index": "str", "raw_total": 0.0, "final": 0.0 }}
-                Divide raw_total by {divisor} for final.
-                """
-
-                # --- SMART RETRY LOGIC ---
-                success = False
-                for attempt in range(3): # Try 3 times
-                    try:
-                        response = model.generate_content([prompt, img])
-                        clean_json = response.text.replace("```json", "").replace("```", "").strip()
-                        data = json.loads(clean_json)
-                        data["Filename"] = file.name
-                        results.append(data)
-                        st.success(f"✅ {data['name']} graded.")
-                        success = True
-                        break # Exit retry loop on success
-                    except Exception as e:
-                        if "429" in str(e):
-                            st.warning(f"🕒 Google limit hit. Waiting 15 seconds to retry... (Attempt {attempt+1})")
-                            time.sleep(15)
-                        else:
-                            st.error(f"❌ Error: {e}")
-                            break
+                # Convert image to Base64 for GPT-4o-mini
+                base64_image = encode_image(file)
                 
-                # --- SAFE DELAY ---
-                # This 10-second sleep is the "secret" to not getting blocked
-                time.sleep(10)
+                try:
+                    response = client.chat.completions.create(
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": f"Extract Student Name, Index, and Sum of RED marks. Divide sum by {divisor}. Return ONLY JSON: {{'name': 'str', 'index': 'str', 'final': 0.0}}"},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                                ],
+                            }
+                        ],
+                        model="gpt-4o-mini",
+                        response_format={ "type": "json_object" }
+                    )
+                    
+                    data = json.loads(response.choices[0].message.content)
+                    results.append(data)
+                    st.success(f"✅ {data['name']} graded.")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error on {file.name}: {e}")
+                
+                # Minute limit safety: 15 requests per minute = 1 every 4 seconds
+                time.sleep(4)
                 progress_bar.progress((i + 1) / len(uploaded_files))
 
-            # --- EXPORT ---
-            st.write("### 📊 Final Results")
+            # --- TABLE & DOWNLOAD ---
             df = pd.DataFrame(results)
             st.dataframe(df)
             
