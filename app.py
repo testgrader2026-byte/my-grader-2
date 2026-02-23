@@ -11,7 +11,7 @@ import json
 st.set_page_config(page_title="AI Exam Dashboard", layout="wide")
 
 # 1. Password Protection
-MASTER_PASSWORD = "your_password_here" 
+MASTER_PASSWORD = "pizza one" 
 
 def check_password():
     if "authenticated" not in st.session_state:
@@ -33,16 +33,16 @@ if check_password():
     divisor = st.sidebar.number_input("Divide marks by:", value=10.0)
     custom_instr = st.sidebar.text_area("Extra Instructions", "Check for student signature.")
 
-    # 3. QR Code Generator for Mobile
+    # 3. QR Code Generator for Mobile Bridge
     st.sidebar.markdown("---")
     st.sidebar.write("📱 **Phone Upload Link**")
     if st.button("Generate QR Code"):
-        # This will get the current URL of the website
-        url = "https://your-app-link.streamlit.app" # You change this after deploying
+        # Note: You will replace this URL with your actual deployed link later
+        url = st.query_params.get("url", "https://your-app.streamlit.app") 
         qr = qrcode.make(url)
         buf = io.BytesIO()
         qr.save(buf)
-        st.sidebar.image(buf.getvalue(), caption="Scan with Phone")
+        st.sidebar.image(buf.getvalue(), caption="Scan with Phone to Upload")
 
     # 4. Main Interface
     st.title("📝 AI Exam Grader Pro")
@@ -50,7 +50,8 @@ if check_password():
 
     if uploaded_files and api_key:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Using Gemini 2.0 Flash for maximum speed and batch stability
+        model = genai.GenerativeModel('gemini-2.0-flash')
 
         if st.button(f"🚀 Start Grading {len(uploaded_files)} Papers"):
             results = []
@@ -63,49 +64,46 @@ if check_password():
                 try:
                     img = Image.open(file)
                     
-                    # Self-Checking Prompt
+                    # High-Accuracy Self-Correction Prompt
                     prompt = f"""
-                    Analyze this exam paper. 
-                    Step 1: Extract Name and Index Number.
-                    Step 2: Find all RED ink marks and sum them.
-                    Step 3: Check your math again.
-                    Step 4: Custom instruction: {custom_instr}
+                    Follow this 3-step logic strictly:
+                    1. DATA EXTRACTION: Identify 'Student Name' and 'Index Number'.
+                    2. GRADING: Sum all red ink marks. List them internally first.
+                    3. VERIFICATION: Re-calculate the sum. If it doesn't match, re-scan.
+                    4. Custom instruction: {custom_instr}
                     
                     Return ONLY a JSON:
-                    {{"name": "str", "index": "str", "raw_sum": 0.0, "final": 0.0, "note": "str"}}
-                    Divide raw_sum by {divisor} for the 'final' value.
+                    {{"name": "str", "index": "str", "raw_total": 0.0, "final": 0.0, "note": "str"}}
+                    Divide raw_total by {divisor} for the 'final' result.
                     """
                     
                     response = model.generate_content([prompt, img])
-                    # Clean the AI text
                     clean_json = response.text.replace("```json", "").replace("```", "").strip()
                     data = json.loads(clean_json)
                     data["Filename"] = file.name
                     results.append(data)
                     
-                    # Show live update
-                    st.success(f"Done: {data['name']} - {data['final']}")
+                    st.success(f"✅ Graded: {data['name']} (Score: {data['final']})")
                     
-                    # 4 second delay to prevent "Too Many Requests" error for 150+ photos
-                    time.sleep(4) 
+                    # 3-second delay to stay within Free Tier limits for large batches
+                    time.sleep(3) 
                     
                 except Exception as e:
-                    st.error(f"Error in {file.name}: {e}")
+                    st.error(f"❌ Error in {file.name}: {e}")
                 
                 progress_bar.progress((i + 1) / len(uploaded_files))
 
-            # 5. Final Results & Download
+            # 5. Export to Excel
             st.write("### 📊 Final Results")
             df = pd.DataFrame(results)
             st.dataframe(df)
 
-            # Excel Download
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, sheet_name='Marks')
+                df.to_excel(writer, index=False)
             
             st.download_button(
-                label="📥 Download Excel File",
+                label="📥 Download Excel Results",
                 data=output.getvalue(),
                 file_name="student_marks.xlsx",
                 mime="application/vnd.ms-excel"
