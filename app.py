@@ -1,24 +1,30 @@
 import streamlit as st
 import pandas as pd
+from PIL import Image
 import json
 import time
 import io
 import base64
 import qrcode
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
+from mistralai import Mistral
 from google.oauth2 import service_account
 from google.cloud import vision
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Pro Exam Grader", layout="wide")
-MASTER_PASSWORD = "your_password" 
-APP_URL = "https://your-app-name.streamlit.app" # Update after deploy
+st.set_page_config(page_title="Ultimate AI Exam Grader", layout="wide")
+MASTER_PASSWORD = "your_password"  # Change this!
+APP_URL = "https://your-app-name.streamlit.app"  # Update after deploy
 
 # --- API CLIENT SETUP ---
 github_token = st.secrets.get("GITHUB_TOKEN", "")
+mistral_key = st.secrets.get("MISTRAL_KEY", "")
+
 openai_client = OpenAI(base_url="https://models.inference.ai.azure.com", api_key=github_token)
+mistral_client = Mistral(api_key=mistral_key) if mistral_key else None
 
 def get_gcp_client():
+    """Authenticates Google Cloud using Streamlit Secrets"""
     gcp_creds = dict(st.secrets["gcp_service_account"])
     credentials = service_account.Credentials.from_service_account_info(gcp_creds)
     return vision.ImageAnnotatorClient(credentials=credentials)
@@ -26,104 +32,204 @@ def get_gcp_client():
 def encode_image(image_file):
     return base64.b64encode(image_file.getvalue()).decode("utf-8")
 
-# --- CORE LOGIC FUNCTIONS ---
+# ====================== IMPROVED HELPERS ======================
+def extract_with_gpt(prompt, text_data=None, image_b64=None, prefer_model="gpt-4o"):
+    """Smart helper: tries preferred model, falls back to gpt-4o-mini on rate limit"""
+    models_to_try = [prefer_model]
+    if prefer_model == "gpt-4o":
+        models_to_try.append("gpt-4o-mini")
+    
+    for model in models_to_try:
+        try:
+            content = [{"type": "text", "text": prompt}]
+            if image_b64:
+                content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
+            if text_data:
+                content[0]["text"] += f"\n\n--- RAW GOOGLE VISION OCR ---\n{text_data}\n-----------------------------"
+            
+            response = openai_client.chat.completions.create(
+                messages=[{"role": "user", "content": content}],
+                model=model,
+                response_format={"type": "json_object"},
+                temperature=0.0,
+                max_tokens=1200
+            )
+            result = json.loads(response.choices[0].message.content)
+            return result, model
+        except RateLimitError:
+            st.warning(f"⚠️ Rate limit hit on {model} — trying fallback...")
+            if model == "gpt-4o-mini":
+                raise
+            continue
+        except Exception as e:
+            st.error(f"Error with {model}: {str(e)[:100]}")
+            if model == models_to_try[-1]:
+                raise
+            continue
+    raise Exception("All GPT models failed")
 
-def extract_logic(prompt, text_data=None, image_b64=None, model="gpt-4o"):
-    """Helper for GPT extraction"""
-    content = [{"type": "text", "text": prompt}]
-    if image_b64:
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
-    if text_data:
-        content[0]["text"] += f"\n\nRAW DATA FROM GOOGLE OCR: {text_data}"
-        
-    response = openai_client.chat.completions.create(
-        messages=[{"role": "user", "content": content}],
-        model=model,
-        response_format={ "type": "json_object" },
-        temperature=0.0
+# ====================== IMPROVED TIER 1 (YOUR MAIN REQUEST) ======================
+def tier_1_google_gpt4o(image_bytes):
+    """Tier 1 — Highest accuracy path (as requested):
+       • Always uses Google Cloud Vision document_text_detection (best for paper/handwriting)
+       • Language hint for English
+       • GPT-4o with automatic fallback to gpt-4o-mini on rate limit
+       • Very strong cleaning prompt"""
+    gcp_client = get_gcp_client()
+    image = vision.Image(content=image_bytes)
+    
+    # Improvement #1: Language hint for English documents/handwriting
+    image_context = vision.ImageContext(language_hints=['en'])
+    
+    response = gcp_client.document_text_detection(
+        image=image,
+        image_context=image_context
+    )
+    
+    if response.error.message:
+        raise Exception(f"Google Vision Error: {response.error.message}")
+    
+    ocr_text = response.full_text_annotation.text.strip()
+    
+    if len(ocr_text) < 30:
+        raise Exception("Google Vision returned almost no text")
+
+    # Improvement #2: Extremely detailed prompt (Gemini + our testing)
+    prompt = """You are an expert OCR post-processor for handwritten/printed student exam answer sheets.
+
+The text below is raw output from Google Cloud Vision DOCUMENT_TEXT_DETECTION on a photo of an exam paper (English).
+
+Your job:
+1. Clean common OCR mistakes (1/l/I, 0/O, 5/S, 8/B, 7/T, etc.)
+2. Extract:
+   - Student full name (cleaned)
+   - Index / roll number / registration number (as string)
+   - List of individual question marks ONLY (integers, in the exact order they appear in the table)
+   
+Rules:
+- Ignore totals, signatures, printed instructions, question text, headers/footers
+- Only include actual per-question scores (typically 0-20 range)
+- If a mark is illegible, skip it (do not guess)
+- Name and index must be cleaned and capitalized properly
+
+Return STRICTLY valid JSON (nothing else):
+{
+  "name": "Full Student Name",
+  "index": "IndexNumberHere",
+  "marks": [5, 8, 0, 9, 7, ...]
+}
+
+RAW OCR TEXT:"""
+
+    data, used_model = extract_with_gpt(prompt, text_data=ocr_text, prefer_model="gpt-4o")
+    return data, used_model
+
+# ====================== UNCHANGED BACKUP TIERS ======================
+def tier_2_mistral(image_b64):
+    """Tier 2: Mistral Pixtral (pure vision)"""
+    prompt = "Extract index, name, and an array of numerical marks from the table. Return strictly JSON: {'name': 'str', 'index': 'str', 'marks': [int]}"
+    response = mistral_client.chat.complete(
+        model="pixtral-12b-2409",
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": f"data:image/jpeg;base64,{image_b64}"}
+        ]}],
+        response_format={"type": "json_object"}
     )
     return json.loads(response.choices[0].message.content)
 
-def tier_1_google_gpt4o(image_bytes):
-    """Google reads the text, GPT-4o thinks about it."""
-    gcp_client = get_gcp_client()
-    image = vision.Image(content=image_bytes)
-    response = gcp_client.document_text_detection(image=image)
-    ocr_text = response.full_text_annotation.text
-    
-    prompt = """
-    Extract the student name, index, and ALL numerical marks from the marks table.
-    Use the provided RAW OCR text to find the numbers. 
-    Return JSON: {"name": "str", "index": "str", "marks": [list of numbers]}
-    """
-    return extract_logic(prompt, text_data=ocr_text, model="gpt-4o")
+def tier_3_gpt4o_vision(image_b64):
+    """Tier 3: GPT-4o Vision directly"""
+    prompt = "Extract index, name, and an array of numerical marks from the table. Return strictly JSON: {'name': 'str', 'index': 'str', 'marks': [int]}"
+    data, _ = extract_with_gpt(prompt, image_b64=image_b64, prefer_model="gpt-4o")
+    return data
 
-def tier_2_gpt4o_vision(image_b64):
-    """GPT-4o looks at the image directly if Google fails."""
-    prompt = "Look at the image. Extract name, index, and marks from the table. Return JSON: {'name': 'str', 'index': 'str', 'marks': [int]}"
-    return extract_logic(prompt, image_b64=image_b64, model="gpt-4o")
+def tier_4_fallback(image_b64):
+    """Tier 4: GPT-4o-mini Vision only"""
+    prompt = "Extract index, name, and an array of numerical marks from the table. Return strictly JSON: {'name': 'str', 'index': 'str', 'marks': [int]}"
+    data, _ = extract_with_gpt(prompt, image_b64=image_b64, prefer_model="gpt-4o-mini")
+    return data
 
-def tier_3_fallback(image_b64):
-    """Emergency fallback to Mini."""
-    prompt = "Extract name, index, and marks. Return JSON: {'name': 'str', 'index': 'str', 'marks': [int]}"
-    return extract_logic(prompt, image_b64=image_b64, model="gpt-4o-mini")
-
-# --- UI ---
+# ====================== AUTH & UI ======================
 if "authenticated" not in st.session_state:
-    pwd = st.text_input("Password", type="password")
-    if pwd == MASTER_PASSWORD: 
+    pwd = st.text_input("Enter Master Password", type="password")
+    if pwd == MASTER_PASSWORD:
         st.session_state.authenticated = True
         st.rerun()
 else:
-    divisor = st.sidebar.number_input("Divide marks by:", value=10.0)
+    st.sidebar.title("⚙️ Settings & Tools")
+    divisor = st.sidebar.number_input("Divide marks by:", value=10.0, step=0.5)
     
     # QR Code
     qr = qrcode.make(APP_URL)
-    buf = io.BytesIO()
-    qr.save(buf, format='PNG')
-    st.sidebar.image(buf.getvalue(), caption="Scan to use phone camera")
+    img_byte_arr = io.BytesIO()
+    qr.save(img_byte_arr, format='PNG')
+    st.sidebar.image(img_byte_arr.getvalue(), caption="Scan to grade with phone")
 
-    st.title("🎯 High-Accuracy Exam Grader")
+    st.title("📝 The Ultimate AI Exam Grader")
     uploaded_files = st.file_uploader("Upload Exam Photos", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'])
 
-    if uploaded_files and st.button("🚀 Start Grading"):
-        results = []
-        for file in uploaded_files:
-            img_bytes = file.getvalue()
-            img_b64 = encode_image(file)
-            
-            # --- THE WATERFALL ---
-            try:
-                data = tier_1_google_gpt4o(img_bytes)
-                tier = "Tier 1: Google + GPT-4o"
-            except:
+    if uploaded_files:
+        if st.button("🚀 Start Grading Process"):
+            results = []
+            progress_bar = st.progress(0)
+
+            for i, file in enumerate(uploaded_files):
+                image_bytes = file.getvalue()
+                image_b64 = encode_image(file)
+                data = None
+                used_tier = "Failed"
+
+                # === NEW WATERFALL WITH SMART TIER 1 ===
                 try:
-                    data = tier_2_gpt4o_vision(img_b64)
-                    tier = "Tier 2: GPT-4o Vision"
-                except:
-                    data = tier_3_fallback(img_b64)
-                    tier = "Tier 3: GPT-4o-mini"
+                    data, used_model = tier_1_google_gpt4o(image_bytes)
+                    used_tier = f"Tier 1: Google Vision + {used_model.upper()}"
+                except Exception as e1:
+                    st.warning(f"Tier 1 failed for {file.name} — trying Tier 2...")
+                    try:
+                        data = tier_2_mistral(image_b64)
+                        used_tier = "Tier 2: Mistral Pixtral"
+                    except Exception as e2:
+                        try:
+                            data = tier_3_gpt4o_vision(image_b64)
+                            used_tier = "Tier 3: GPT-4o Vision"
+                        except Exception as e3:
+                            try:
+                                data = tier_4_fallback(image_b64)
+                                used_tier = "Tier 4: GPT-4o-mini Vision"
+                            except Exception as e4:
+                                st.error(f"❌ All systems failed on {file.name}")
+                                continue
 
-            # Clean the list (Ensures no strings or 0 errors)
-            raw_marks = data.get("marks", [])
-            clean_marks = []
-            for m in raw_marks:
-                try: clean_marks.append(float(m))
-                except: continue
+                # Math
+                clean_marks = [int(float(m)) for m in data.get("marks", []) 
+                               if str(m).replace('.', '', 1).replace('-', '', 1).isdigit()]
+                final_score = sum(clean_marks) / divisor
+
+                results.append({
+                    "File Name": file.name,
+                    "Index": data.get("index", "N/A"),
+                    "Name": data.get("name", "N/A"),
+                    "Extracted Marks List": str(clean_marks),
+                    "Total Questions": len(clean_marks),
+                    "Final Score": round(final_score, 2),
+                    "Engine Used": used_tier
+                })
+
+                st.success(f"✅ Processed {file.name} → {used_tier}")
+                time.sleep(1.8)  # Rate-limit safety
+                progress_bar.progress((i + 1) / len(uploaded_files))
+
+            if results:
+                df = pd.DataFrame(results)
+                st.dataframe(df, use_container_width=True)
                 
-            final_score = sum(clean_marks) / divisor
-            
-            results.append({
-                "Student": data.get("name", "N/A"),
-                "Index": data.get("index", "N/A"),
-                "Marks Found": str(clean_marks),
-                "Final Score": final_score,
-                "Model Used": tier
-            })
-            st.success(f"✅ Graded {file.name} using {tier}")
-            time.sleep(2)
-
-        if results:
-            df = pd.DataFrame(results)
-            st.table(df)
-            # Excel Download... (omitted for brevity, keep your old excel code here)
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    df.to_excel(writer, index=False)
+                st.download_button(
+                    "📥 Download Excel",
+                    data=output.getvalue(),
+                    file_name="final_marks.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
