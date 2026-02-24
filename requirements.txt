@@ -2,8 +2,7 @@ streamlit
 pandas
 Pillow
 openai
-requests
+google-cloud-vision
 qrcode
 xlsxwriter
-mistralai
-google-cloud-vision
+google-auth
