@@ -1,5 +1,9 @@
 streamlit
 pandas
-pillow
+Pillow
 openai
+requests
+qrcode
 xlsxwriter
+mistralai
+google-cloud-vision
